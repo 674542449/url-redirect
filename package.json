@@ -1,0 +1,11 @@
+{
+  "name": "docker-url-redirect",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "轻量零依赖自定义域名短链接路由跳转与统计系统 (Docker + Node.js + SQLite)",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/app.test.mjs"
+  }
+}
