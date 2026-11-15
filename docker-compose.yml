@@ -1,5 +1,8 @@
 services:
   url-redirect:
+    # 预构建多架构镜像（自动识别并拉取 x86_64 / arm64 对应架构版本）
+    # 如需在本地修改源码后重新构建，运行: docker compose up -d --build
+    image: ghcr.io/674542449/url-redirect:latest
     build: .
     container_name: url-redirect
     restart: unless-stopped

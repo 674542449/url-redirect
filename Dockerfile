@@ -1,4 +1,8 @@
+# 官方多架构基础镜像，原生支持 linux/amd64 (x86_64) 与 linux/arm64 (aarch64)
 FROM node:24-alpine
+
+LABEL org.opencontainers.image.source="https://github.com/674542449/url-redirect" \
+      org.opencontainers.image.description="轻量零依赖自定义域名短链接与路由跳转系统 (amd64 / arm64)"
 
 WORKDIR /app
 
@@ -8,11 +12,9 @@ ENV NODE_ENV=production \
     DB_PATH=/app/data/links.db \
     ADMIN_PATH=/admin
 
-# 零第三方依赖，直接复制源码即可运行，构建仅需 2 秒且无需联网 npm install
+# 零第三方依赖、零编译步骤，x86 与 ARM 架构通用
 COPY package.json server.mjs ./
 COPY src ./src
-
-RUN mkdir -p /app/data
 
 VOLUME ["/app/data"]
 

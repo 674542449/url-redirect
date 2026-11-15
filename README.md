@@ -1,6 +1,8 @@
-# 自定义域名短链接与路由跳转系统（Docker 独立部署版）
+# 自定义域名短链接与路由跳转系统（Docker 多架构版：支持 x86 & ARM）
 
-零第三方依赖、极低内存占用（约 35MB），基于 **Docker + Node.js 24 原生 HTTP & SQLite (WAL)** 构建的域名路由跳转管理系统。完全脱离 Cloudflare，部署在你自己的任意服务器上。
+零第三方依赖、极低内存占用（约 35MB），基于 **Docker + Node.js 24 原生 HTTP & SQLite (WAL)** 构建的域名路由跳转管理系统。
+
+- **多架构原生支持**：通过 GitHub Actions 自动构建并发布 **`linux/amd64` (x86_64)** 与 **`linux/arm64` (aarch64，如甲骨文云 ARM、树莓派、华为鲲鹏、Apple Silicon)** 双架构镜像，Docker 会自动识别服务器 CPU 架构拉取对应镜像，零 C++ 编译依赖。
 
 绑定域名（如 `abc.com`）后即可实现：
 - 访问 `http(s)://abc.com/abc` ➔ 跳转到自定义地址 A
@@ -10,11 +12,24 @@
 
 ---
 
-## 一、服务器 Docker 快速部署
+## 一、服务器快速部署（x86 / ARM 自动适配）
 
-### 1. 克隆仓库并设置密码
+### 方式 1：无需克隆源码，单条命令直接拉取多架构镜像启动（推荐）
 
-在装有 Docker 的 Linux 服务器上直接执行：
+在任意 **x86_64** 或 **ARM64** 的 Linux 服务器上直接执行（请把 `your-strong-password` 替换为你自己的后台密码）：
+
+```bash
+docker run -d \
+  --name url-redirect \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e ADMIN_PASSWORD=your-strong-password \
+  -e ADMIN_PATH=/admin \
+  -v $(pwd)/url-data:/app/data \
+  ghcr.io/674542449/url-redirect:latest
+```
+
+### 方式 2：使用 Docker Compose 部署（或本地源码构建）
 
 ```bash
 git clone https://github.com/674542449/url-redirect.git
@@ -27,11 +42,11 @@ ADMIN_PATH=/admin
 ADMIN_PASSWORD=your-strong-password
 EOF
 
-# 一键构建并后台启动（零外部依赖，约 2 秒完成）
-docker compose up -d --build
+# 直接拉取预构建好的多架构镜像启动（若想在本地自行编译镜像可加上 --build）
+docker compose up -d
 ```
 
-- 启动后数据会自动持久化保存在当前目录的 `./data/links.db` 中，重启或升级容器均不会丢失任何短链接和点击统计。
+- 启动后数据会自动持久化保存在本地数据卷中，重启或升级容器均不会丢失任何短链接和点击统计。
 - 先通过 `http://你的服务器IP:8080/admin` 即可测试登录后台。
 
 ---
@@ -64,19 +79,16 @@ server {
 ```
 
 ### 方式 B：服务器没有装 Nginx，直接绑定 80 端口
-将 `.env` 中的 `HOST_PORT=8080` 改为 `HOST_PORT=80`，然后重新运行 `docker compose up -d`，即可直接通过 `http://abc.com/abc` 访问跳转。
+将 `-p 8080:8080` 改为 `-p 80:8080`（或将 `.env` 中的 `HOST_PORT=8080` 改为 `HOST_PORT=80`），重启容器后即可直接通过 `http://abc.com/abc` 访问跳转。
 
 ---
 
 ## 三、常用运维命令
 
 ```bash
+# 更新到最新镜像（Docker Compose 方式）
+docker compose pull && docker compose up -d
+
 # 查看运行状态与日志
-docker compose logs -f
-
-# 修改 .env 密码或端口后重启生效
-docker compose up -d
-
-# 停止服务
-docker compose down
+docker logs -f url-redirect
 ```
