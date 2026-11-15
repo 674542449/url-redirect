@@ -1,6 +1,13 @@
 /**
- * 独立部署版（Docker / Node.js + SQLite）自定义域名短链接与路由跳转系统
- * 零外部 npm 依赖，基于 Node.js 原生 node:http + node:sqlite + node:crypto
+ * 独立部署版（Docker / Node.js + SQLite）自定义域名短链接与路由跳转系统（安全加固版）
+ *
+ * 安全机制：
+ * 1. 强密码强制策略：拒绝空密码、少于 8 位密码及常见弱口令（未合规时自动锁定后台拒绝一切登录）
+ * 2. 内存硬哈希鉴权：使用异步 scrypt + timingSafeEqual 常量时间比对
+ * 3. 有状态服务端会话：256 位随机 CSPRNG 令牌，数据库仅存 SHA-256 哈希，支持服务端真注销与改密即刻踢出所有旧会话
+ * 4. 防暴力破解限流：基于真实客户端 IP（防伪造 X-Forwarded-For）连续失败锁定保护 + 内存上限淘汰防 OOM
+ * 5. 路径隐匿支持：管理页面与所有后台 API 均挂载于 ADMIN_PATH 下，无任何未授权信息泄露
+ * 6. 严格安全头与防跨站：动态 Nonce CSP、SameSite=Strict、Path 隔离、X-Requested-With + Origin 双重防 CSRF
  */
 
 import fs from 'node:fs';
@@ -8,7 +15,30 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
-const MAX_BODY_BYTES = 1024 * 1024; // 1 MB
+const MAX_JSON_BODY_BYTES = 1024 * 1024; // 批量导入等管理接口最大 1 MB
+const MAX_LOGIN_BODY_BYTES = 4 * 1024;   // 登录接口最大 4 KB，防止超大请求体消耗内存
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 会话有效期 24 小时
+const MAX_ACTIVE_SESSIONS = 20;
+const MAX_RATE_LIMIT_ENTRIES = 5000;
+
+const WEAK_PASSWORD_BLOCKLIST = new Set([
+  'admin',
+  'admin123',
+  'admin888',
+  'administrator',
+  'root1234',
+  '12345678',
+  '123456789',
+  '1234567890',
+  '88888888',
+  '00000000',
+  'password',
+  'password123',
+  'qwerty123',
+  'qwertyuiop',
+  'change-me-please',
+  'your-strong-password',
+]);
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -17,13 +47,66 @@ class HttpError extends Error {
   }
 }
 
+function isStrongAdminPassword(pw) {
+  if (typeof pw !== 'string') return false;
+  const trimmed = pw.trim();
+  if (trimmed.length < 8 || trimmed.length > 256) return false;
+  if (WEAK_PASSWORD_BLOCKLIST.has(trimmed.toLowerCase())) return false;
+  return true;
+}
+
+function normalizeIp(ip) {
+  const raw = String(ip || '').trim();
+  if (raw.startsWith('::ffff:')) return raw.slice(7);
+  return raw;
+}
+
+function isTrustedProxyIp(ip) {
+  const clean = normalizeIp(ip).toLowerCase();
+  if (!clean) return false;
+  if (clean === '127.0.0.1' || clean === '::1' || clean.startsWith('127.')) return true;
+  if (clean.startsWith('10.') || clean.startsWith('192.168.')) return true;
+  if (clean.startsWith('fc') || clean.startsWith('fd') || clean.startsWith('fe80:')) return true;
+  const m172 = clean.match(/^172\.(\d+)\./);
+  if (m172) {
+    const second = Number(m172[1]);
+    if (second >= 16 && second <= 31) return true;
+  }
+  return false;
+}
+
+function scryptAsync(password, salt) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 32, { N: 16384, r: 8, p: 1 }, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey);
+    });
+  });
+}
+
 export function createApp(options = {}) {
   const dbPath = options.dbPath || process.env.DB_PATH || './data/links.db';
-  const adminPassword = String(options.adminPassword ?? process.env.ADMIN_PASSWORD ?? 'admin123').trim();
+  const rawPassword = String(options.adminPassword ?? process.env.ADMIN_PASSWORD ?? '').trim();
+  const passwordConfigured = isStrongAdminPassword(rawPassword);
+
   const rawAdminPath = String(options.adminPath ?? process.env.ADMIN_PATH ?? '/admin').trim();
   const cleanAdmin = '/' + rawAdminPath.replace(/^\/+|\/+$/g, '');
   const adminPath = cleanAdmin === '/' ? '/admin' : cleanAdmin;
-  const signingSecret = `${adminPassword}::${process.env.SESSION_SECRET || ''}::docker-shortlink-v1`;
+  const apiPrefix = `${adminPath}/api/`;
+
+  const maxLoginAttempts = Number(options.maxLoginAttempts) || 5;
+  const loginLockoutMs = Number(options.loginLockoutMs) || 15 * 60 * 1000; // 默认锁定 15 分钟
+  const failDelayMs = options.failDelayMs !== undefined ? Number(options.failDelayMs) : 120;
+  const trustProxy = options.trustProxy !== undefined ? Boolean(options.trustProxy) : true;
+
+  // 预派生管理员密码 scrypt 摘要（避免明文常驻比对，同时防御时序攻击）
+  const pwSalt = crypto.randomBytes(16);
+  const expectedPwHash = passwordConfigured
+    ? crypto.scryptSync(rawPassword, pwSalt, 32, { N: 16384, r: 8, p: 1 })
+    : null;
+  const pwFingerprint = passwordConfigured
+    ? crypto.createHash('sha256').update('shortlink-pw-fp-v1::' + rawPassword).digest('hex').slice(0, 32)
+    : '';
 
   if (dbPath !== ':memory:') {
     fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
@@ -48,9 +131,15 @@ export function createApp(options = {}) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_links_created_at ON links(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      token_hash TEXT PRIMARY KEY,
+      pw_fingerprint TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
   `);
 
-  // 预编译高频 SQL 语句，单次查询耗时 < 0.05ms
   const stmts = {
     getBySlug: db.prepare(
       'SELECT slug, url, status_code, clicks, note, enabled, created_at, updated_at, last_accessed_at FROM links WHERE slug = ?'
@@ -82,7 +171,83 @@ export function createApp(options = {}) {
         enabled = excluded.enabled,
         updated_at = excluded.updated_at
     `),
+    // 会话管理 SQL
+    insertSession: db.prepare(
+      'INSERT INTO sessions (token_hash, pw_fingerprint, created_at, expires_at) VALUES (?, ?, ?, ?)'
+    ),
+    getSession: db.prepare(
+      'SELECT token_hash, pw_fingerprint, expires_at FROM sessions WHERE token_hash = ?'
+    ),
+    deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash = ?'),
+    purgeInvalidSessions: db.prepare(
+      'DELETE FROM sessions WHERE expires_at <= ? OR pw_fingerprint != ?'
+    ),
+    trimOldSessions: db.prepare(`
+      DELETE FROM sessions WHERE token_hash NOT IN (
+        SELECT token_hash FROM sessions ORDER BY created_at DESC LIMIT ?
+      )
+    `),
   };
+
+  // 启动时立即清理过期或旧密码签发的会话
+  stmts.purgeInvalidSessions.run(Date.now(), pwFingerprint);
+
+  // 登录防爆破内存表: ip -> { count, firstAt, lockedUntil }
+  const loginRateMap = new Map();
+
+  function pruneRateMap(now) {
+    if (loginRateMap.size <= MAX_RATE_LIMIT_ENTRIES) return;
+    for (const [k, v] of loginRateMap.entries()) {
+      if (v.lockedUntil <= now && now - v.firstAt > loginLockoutMs) {
+        loginRateMap.delete(k);
+      }
+      if (loginRateMap.size <= MAX_RATE_LIMIT_ENTRIES * 0.8) break;
+    }
+    while (loginRateMap.size > MAX_RATE_LIMIT_ENTRIES) {
+      const oldestKey = loginRateMap.keys().next().value;
+      loginRateMap.delete(oldestKey);
+    }
+  }
+
+  function checkLoginRateLimit(ip) {
+    const now = Date.now();
+    const record = loginRateMap.get(ip);
+    if (!record) return { allowed: true };
+
+    if (record.lockedUntil > now) {
+      const remainMin = Math.max(1, Math.ceil((record.lockedUntil - now) / 60000));
+      return {
+        allowed: false,
+        retryAfterSec: Math.ceil((record.lockedUntil - now) / 1000),
+        message: `密码连续错误次数过多，当前 IP 已锁定，请 ${remainMin} 分钟后再试`,
+      };
+    }
+
+    if (now - record.firstAt > loginLockoutMs) {
+      loginRateMap.delete(ip);
+    }
+    return { allowed: true };
+  }
+
+  function recordLoginFailure(ip) {
+    const now = Date.now();
+    pruneRateMap(now);
+    const prev = loginRateMap.get(ip);
+    if (!prev || now - prev.firstAt > loginLockoutMs) {
+      loginRateMap.set(ip, { count: 1, firstAt: now, lockedUntil: 0 });
+      return maxLoginAttempts - 1;
+    }
+    prev.count += 1;
+    if (prev.count >= maxLoginAttempts) {
+      prev.lockedUntil = now + loginLockoutMs;
+      return 0;
+    }
+    return maxLoginAttempts - prev.count;
+  }
+
+  function clearLoginFailures(ip) {
+    loginRateMap.delete(ip);
+  }
 
   function normalizeRow(row) {
     if (!row) return null;
@@ -100,43 +265,56 @@ export function createApp(options = {}) {
   }
 
   // ==========================================================================
-  // 安全鉴权与校验辅助函数
+  // 安全鉴权与会话管理
   // ==========================================================================
 
-  function verifyPassword(input) {
-    if (!adminPassword || typeof input !== 'string') return false;
-    const hashA = crypto.createHash('sha256').update(input).digest();
-    const hashB = crypto.createHash('sha256').update(adminPassword).digest();
-    return crypto.timingSafeEqual(hashA, hashB);
+  async function verifyPassword(input) {
+    if (!passwordConfigured || !expectedPwHash || typeof input !== 'string') return false;
+    if (input.length === 0 || input.length > 256) return false;
+    const derived = await scryptAsync(input, pwSalt);
+    return crypto.timingSafeEqual(derived, expectedPwHash);
   }
 
-  function signPayload(payload) {
-    return crypto.createHmac('sha256', signingSecret).update(payload).digest('hex');
+  function hashToken(rawToken) {
+    return crypto.createHash('sha256').update(rawToken).digest('hex');
   }
 
-  function createSessionToken() {
-    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 天有效期
-    const nonce = crypto.randomBytes(12).toString('hex');
-    const payload = `${expiresAt}.${nonce}`;
-    const sig = signPayload(payload);
-    return `${payload}.${sig}`;
+  function extractRawSessionToken(cookieHeader) {
+    if (!cookieHeader) return null;
+    const match = String(cookieHeader).match(/(?:^|;\s*)sl_session=([A-Za-z0-9_-]{32,128})/);
+    return match ? match[1] : null;
+  }
+
+  function createSession() {
+    const now = Date.now();
+    const rawToken = crypto.randomBytes(32).toString('base64url');
+    const tokenHash = hashToken(rawToken);
+    stmts.purgeInvalidSessions.run(now, pwFingerprint);
+    stmts.insertSession.run(tokenHash, pwFingerprint, now, now + SESSION_TTL_MS);
+    stmts.trimOldSessions.run(MAX_ACTIVE_SESSIONS);
+    return rawToken;
   }
 
   function verifySessionCookie(cookieHeader) {
-    if (!adminPassword || !cookieHeader) return false;
-    const match = String(cookieHeader).match(/(?:^|;\s*)sl_session=([^;]+)/);
-    if (!match) return false;
+    if (!passwordConfigured) return false;
+    const rawToken = extractRawSessionToken(cookieHeader);
+    if (!rawToken) return false;
 
-    const parts = match[1].split('.');
-    if (parts.length !== 3) return false;
+    const tokenHash = hashToken(rawToken);
+    const row = stmts.getSession.get(tokenHash);
+    if (!row) return false;
 
-    const [expiresStr, nonce, sig] = parts;
-    const expiresAt = Number(expiresStr);
-    if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) return false;
+    if (Number(row.expires_at) <= Date.now() || String(row.pw_fingerprint) !== pwFingerprint) {
+      stmts.deleteSession.run(tokenHash);
+      return false;
+    }
+    return true;
+  }
 
-    const expected = signPayload(`${expiresStr}.${nonce}`);
-    if (sig.length !== expected.length) return false;
-    return crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expected, 'utf8'));
+  function destroySessionCookie(cookieHeader) {
+    const rawToken = extractRawSessionToken(cookieHeader);
+    if (!rawToken) return;
+    stmts.deleteSession.run(hashToken(rawToken));
   }
 
   function normalizeAndValidateSlug(rawSlug) {
@@ -175,8 +353,6 @@ export function createApp(options = {}) {
     if (
       lower === adminClean ||
       lower.startsWith(adminClean + '/') ||
-      lower === '__admin_api' ||
-      lower.startsWith('__admin_api/') ||
       lower === 'healthz' ||
       lower === 'favicon.ico' ||
       lower === 'robots.txt'
@@ -220,15 +396,41 @@ export function createApp(options = {}) {
       }
     }
 
-    // 使用 parsed.toString() 将中文域名/中文路径自动转为合法 ASCII URI，防止 HTTP Location 头抛 ERR_INVALID_CHAR
     return { ok: true, url: parsed.toString() };
   }
 
   function getRequestContext(req) {
-    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
-    const proto = forwardedProto === 'https' ? 'https' : 'http';
-    const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
-    const rawHost = forwardedHost || String(req.headers.host || '').trim() || 'localhost';
+    const socketIp = normalizeIp(req.socket && req.socket.remoteAddress) || '0.0.0.0';
+    const fromTrustedProxy = trustProxy && isTrustedProxyIp(socketIp);
+
+    let proto = 'http';
+    let rawHost = String(req.headers.host || '').trim() || 'localhost';
+    let clientIp = socketIp;
+
+    if (fromTrustedProxy) {
+      const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+        .split(',')[0]
+        .trim()
+        .toLowerCase();
+      if (forwardedProto === 'https') proto = 'https';
+
+      const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+      if (forwardedHost) rawHost = forwardedHost;
+
+      const xRealIp = normalizeIp(req.headers['x-real-ip']);
+      if (xRealIp) {
+        clientIp = xRealIp;
+      } else if (req.headers['x-forwarded-for']) {
+        const xffList = String(req.headers['x-forwarded-for'])
+          .split(',')
+          .map((s) => normalizeIp(s))
+          .filter(Boolean);
+        // 取最右侧由反向代理追加的客户端 IP，防止客户端伪造左侧 X-Forwarded-For 绕过限流
+        if (xffList.length > 0) {
+          clientIp = xffList[xffList.length - 1];
+        }
+      }
+    }
 
     let host = 'localhost';
     let origin = `${proto}://localhost`;
@@ -238,7 +440,6 @@ export function createApp(options = {}) {
       origin = parsedOrigin.origin;
     } catch {}
 
-    // 防止请求行以 "//evil.com" 开头时被 new URL 解析为外部协议相对域名
     const rawReqUrl = String(req.url || '/');
     const safeRelUrl = rawReqUrl.startsWith('/') ? '/' + rawReqUrl.replace(/^\/+/, '') : '/';
     let parsedUrl;
@@ -247,15 +448,16 @@ export function createApp(options = {}) {
     } catch {
       parsedUrl = new URL('/', origin);
     }
-    return { proto, isHttps: proto === 'https', host, origin, parsedUrl };
+
+    return { proto, isHttps: proto === 'https', host, origin, clientIp, parsedUrl };
   }
 
-  async function readJsonBody(req) {
+  async function readJsonBody(req, maxBytes = MAX_JSON_BODY_BYTES) {
     const chunks = [];
     let total = 0;
     for await (const chunk of req) {
       total += chunk.length;
-      if (total > MAX_BODY_BYTES) {
+      if (total > maxBytes) {
         throw new HttpError(413, '请求体过大');
       }
       chunks.push(chunk);
@@ -273,6 +475,8 @@ export function createApp(options = {}) {
     res.writeHead(status, {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
       ...extraHeaders,
     });
     res.end(payload);
@@ -288,48 +492,87 @@ export function createApp(options = {}) {
   }
 
   // ==========================================================================
-  // 后台 API 控制器 (/__admin_api/*)
+  // 后台管理 API 控制器 (${adminPath}/api/*)
   // ==========================================================================
 
   async function handleAdminApi(req, res, ctx) {
-    const pathname = ctx.parsedUrl.pathname;
+    const subPath = '/' + ctx.parsedUrl.pathname.slice(apiPrefix.length);
     const method = (req.method || 'GET').toUpperCase();
 
-    if (pathname === '/__admin_api/session' && method === 'GET') {
+    // 1. 会话状态检查（不泄露 adminPath 等任何内部配置）
+    if (subPath === '/session' && method === 'GET') {
       return sendJson(res, 200, {
+        configured: passwordConfigured,
         authenticated: verifySessionCookie(req.headers.cookie),
-        adminPath,
       });
     }
 
+    // 2. 双重防跨站请求伪造 (CSRF)：校验自定义头 + Origin 同源校验
     if (method !== 'GET' && method !== 'HEAD') {
       if (req.headers['x-requested-with'] !== 'ShortLinkAdmin') {
         return sendJson(res, 403, { error: '非法请求来源 (CSRF 校验未通过)' });
       }
+      if (req.headers.origin && String(req.headers.origin).toLowerCase() !== ctx.origin.toLowerCase()) {
+        return sendJson(res, 403, { error: '非法跨源请求 (Origin 不匹配)' });
+      }
+    }
+
+    // 3. 若未配置满足强度要求的密码，彻底锁定后台所有写/登录接口
+    if (!passwordConfigured) {
+      return sendJson(
+        res,
+        503,
+        { error: '安全锁定：未配置有效的 ADMIN_PASSWORD（要求至少 8 位且不能使用常见弱密码），后台已禁止登录' }
+      );
     }
 
     try {
-      if (pathname === '/__admin_api/login' && method === 'POST') {
-        const body = await readJsonBody(req);
-        if (!verifyPassword(String(body.password || ''))) {
-          return sendJson(res, 401, { error: '管理密码不正确，请重试' });
+      // 4. 登录接口（带 IP 防爆破锁定与 scrypt 校验）
+      if (subPath === '/login' && method === 'POST') {
+        const rateCheck = checkLoginRateLimit(ctx.clientIp);
+        if (!rateCheck.allowed) {
+          return sendJson(
+            res,
+            429,
+            { error: rateCheck.message },
+            { 'Retry-After': String(rateCheck.retryAfterSec) }
+          );
         }
-        const token = createSessionToken();
-        const cookie = `sl_session=${token}; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict${ctx.isHttps ? '; Secure' : ''}`;
+
+        const body = await readJsonBody(req, MAX_LOGIN_BODY_BYTES);
+        const ok = await verifyPassword(String(body.password || ''));
+        if (!ok) {
+          const remaining = recordLoginFailure(ctx.clientIp);
+          if (failDelayMs > 0) {
+            await new Promise((r) => setTimeout(r, failDelayMs));
+          }
+          const msg =
+            remaining > 0
+              ? `管理密码不正确（还剩 ${remaining} 次尝试机会）`
+              : '密码连续错误次数过多，当前 IP 已被锁定 15 分钟';
+          return sendJson(res, remaining > 0 ? 401 : 429, { error: msg });
+        }
+
+        clearLoginFailures(ctx.clientIp);
+        const rawToken = createSession();
+        const cookie = `sl_session=${rawToken}; Path=${adminPath}; Max-Age=86400; HttpOnly; SameSite=Strict${ctx.isHttps ? '; Secure' : ''}`;
         return sendJson(res, 200, { ok: true }, { 'Set-Cookie': cookie });
       }
 
-      if (pathname === '/__admin_api/logout' && method === 'POST') {
-        const cookie = `sl_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict${ctx.isHttps ? '; Secure' : ''}`;
+      // 5. 退出登录（立即从数据库销毁服务端会话）
+      if (subPath === '/logout' && method === 'POST') {
+        destroySessionCookie(req.headers.cookie);
+        const cookie = `sl_session=; Path=${adminPath}; Max-Age=0; HttpOnly; SameSite=Strict${ctx.isHttps ? '; Secure' : ''}`;
         return sendJson(res, 200, { ok: true }, { 'Set-Cookie': cookie });
       }
 
+      // 以下接口均需已登录的有效会话
       if (!verifySessionCookie(req.headers.cookie)) {
         return sendJson(res, 401, { error: '登录已过期或未授权，请重新登录' });
       }
 
       // 查询全部短链接
-      if (pathname === '/__admin_api/links' && method === 'GET') {
+      if (subPath === '/links' && method === 'GET') {
         const links = stmts.listAll.all().map(normalizeRow);
         let totalClicks = 0;
         let activeCount = 0;
@@ -348,7 +591,7 @@ export function createApp(options = {}) {
       }
 
       // 新建短链接
-      if (pathname === '/__admin_api/links' && method === 'POST') {
+      if (subPath === '/links' && method === 'POST') {
         const body = await readJsonBody(req);
         const slugCheck = normalizeAndValidateSlug(body.slug);
         if (!slugCheck.ok) return sendJson(res, 400, { error: slugCheck.error });
@@ -392,7 +635,7 @@ export function createApp(options = {}) {
       }
 
       // 更新短链接
-      if (pathname === '/__admin_api/links' && method === 'PUT') {
+      if (subPath === '/links' && method === 'PUT') {
         const body = await readJsonBody(req);
         const oldCheck = normalizeAndValidateSlug(body.old_slug ?? body.slug);
         if (!oldCheck.ok) return sendJson(res, 400, { error: oldCheck.error });
@@ -476,7 +719,7 @@ export function createApp(options = {}) {
       }
 
       // 快捷启停
-      if (pathname === '/__admin_api/links/toggle' && method === 'PATCH') {
+      if (subPath === '/links/toggle' && method === 'PATCH') {
         const body = await readJsonBody(req);
         const slugCheck = normalizeAndValidateSlug(body.slug);
         if (!slugCheck.ok) return sendJson(res, 400, { error: slugCheck.error });
@@ -493,7 +736,7 @@ export function createApp(options = {}) {
       }
 
       // 删除短链接
-      if (pathname === '/__admin_api/links' && method === 'DELETE') {
+      if (subPath === '/links' && method === 'DELETE') {
         const body = await readJsonBody(req);
         const slugCheck = normalizeAndValidateSlug(body.slug);
         if (!slugCheck.ok) return sendJson(res, 400, { error: slugCheck.error });
@@ -503,7 +746,7 @@ export function createApp(options = {}) {
       }
 
       // 批量导入 JSON
-      if (pathname === '/__admin_api/import' && method === 'POST') {
+      if (subPath === '/import' && method === 'POST') {
         const body = await readJsonBody(req);
         const list = Array.isArray(body.links) ? body.links : [];
         if (list.length === 0) {
@@ -632,11 +875,16 @@ export function createApp(options = {}) {
     res.writeHead(status, {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
     });
     res.end(html);
   }
 
   function sendAdminHtml(res) {
+    const nonce = crypto.randomBytes(16).toString('base64');
+    const safeApiBaseJson = JSON.stringify(adminPath + '/api').replace(/</g, '\\u003c');
+
     const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -728,6 +976,15 @@ export function createApp(options = {}) {
     .btn-danger-ghost { background: transparent; color: var(--danger); padding: 5px 8px; }
     .btn-danger-ghost:hover { background: var(--danger-bg); }
     .btn-sm { padding: 5px 10px; font-size: 13px; border-radius: 6px; }
+    .link-btn {
+      background: none;
+      border: none;
+      padding: 0;
+      font-size: 12px;
+      color: var(--primary);
+      cursor: pointer;
+    }
+    .link-btn:hover { text-decoration: underline; }
 
     .container { max-width: 1160px; margin: 24px auto; padding: 0 20px 48px; }
 
@@ -744,11 +1001,27 @@ export function createApp(options = {}) {
       border-radius: 16px;
       padding: 32px;
       width: 100%;
-      max-width: 420px;
+      max-width: 440px;
       box-shadow: 0 8px 28px rgba(15, 23, 42, 0.05);
     }
     .auth-card h2 { font-size: 20px; margin-bottom: 6px; }
-    .auth-sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+    .auth-sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; line-height: 1.6; }
+    .lock-alert {
+      background: var(--danger-bg);
+      border: 1px solid #fecaca;
+      color: #991b1b;
+      padding: 14px 16px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    code {
+      background: #f1f5f9;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
 
     .stats-grid {
       display: grid;
@@ -978,10 +1251,20 @@ export function createApp(options = {}) {
     </div>
   </header>
 
+  <section id="lockedView" class="center-wrap hidden">
+    <div class="auth-card">
+      <h2>后台已安全锁定</h2>
+      <p class="auth-sub">为防止默认密码或弱口令导致后台被入侵，系统已自动阻断所有登录请求。</p>
+      <div class="lock-alert">
+        请在服务器的 <code>.env</code> 文件或 Docker 环境变量中配置至少 <strong>8 位</strong>的强密码 <code>ADMIN_PASSWORD</code>（禁止使用 <code>admin123</code>、<code>12345678</code> 等常见弱口令），然后重启容器生效。
+      </div>
+    </div>
+  </section>
+
   <section id="loginView" class="center-wrap hidden">
     <div class="auth-card">
       <h2>管理员登录</h2>
-      <p class="auth-sub">请输入后台管理密码以管理域名跳转规则</p>
+      <p class="auth-sub">请输入后台管理密码（连续输错 5 次将自动锁定当前 IP）</p>
       <form id="loginForm">
         <div class="form-group">
           <label class="form-label" for="passwordInput">后台管理密码</label>
@@ -1007,7 +1290,7 @@ export function createApp(options = {}) {
       <div class="stat-card">
         <div class="stat-label">本地持久化引擎</div>
         <div class="stat-value" style="font-size: 20px; padding-top: 4px;">SQLite (WAL)</div>
-        <div class="stat-extra">Docker 数据卷持久保存</div>
+        <div class="stat-extra">服务端有状态安全会话保护</div>
       </div>
     </div>
 
@@ -1055,7 +1338,7 @@ export function createApp(options = {}) {
         <div class="form-group">
           <div class="form-label">
             <label for="slugInput">自定义路径后缀 *</label>
-            <a href="javascript:void(0)" id="randomSlugBtn" style="font-size: 12px; color: var(--primary); text-decoration: none;">随机生成短码</a>
+            <button id="randomSlugBtn" type="button" class="link-btn">随机生成短码</button>
           </div>
           <div class="slug-input-group">
             <span id="slugOriginPrefix" class="slug-prefix"></span>
@@ -1097,8 +1380,9 @@ export function createApp(options = {}) {
 
   <div id="toastEl" class="toast hidden"></div>
 
-  <script>
+  <script nonce="${nonce}">
     (function () {
+      var API_BASE = ${safeApiBaseJson};
       var origin = window.location.origin;
       var allLinks = [];
       var toastTimer = null;
@@ -1116,7 +1400,7 @@ export function createApp(options = {}) {
         }, 2800);
       }
 
-      async function apiFetch(path, options) {
+      async function apiFetch(subPath, options) {
         var opts = options || {};
         var headers = Object.assign({ 'X-Requested-With': 'ShortLinkAdmin' }, opts.headers || {});
         if (opts.body && typeof opts.body === 'object') {
@@ -1124,7 +1408,7 @@ export function createApp(options = {}) {
           opts.body = JSON.stringify(opts.body);
         }
         opts.headers = headers;
-        var res = await fetch(path, opts);
+        var res = await fetch(API_BASE + subPath, opts);
         var data = {};
         try {
           data = await res.json();
@@ -1254,7 +1538,7 @@ export function createApp(options = {}) {
           chk.checked = Boolean(item.enabled);
           chk.onchange = async function () {
             try {
-              await apiFetch('/__admin_api/links/toggle', {
+              await apiFetch('/links/toggle', {
                 method: 'PATCH',
                 body: { slug: item.slug, enabled: chk.checked }
               });
@@ -1289,7 +1573,7 @@ export function createApp(options = {}) {
             var label = item.slug === '@' ? '域名首页 (/)' : ('/' + item.slug);
             if (!window.confirm('确定要删除跳转规则 "' + label + '" 吗？')) return;
             try {
-              await apiFetch('/__admin_api/links', {
+              await apiFetch('/links', {
                 method: 'DELETE',
                 body: { slug: item.slug }
               });
@@ -1315,7 +1599,7 @@ export function createApp(options = {}) {
 
       async function loadLinks() {
         try {
-          var data = await apiFetch('/__admin_api/links');
+          var data = await apiFetch('/links');
           allLinks = data.links || [];
           document.getElementById('statTotalLinks').textContent = data.stats.totalLinks.toLocaleString();
           document.getElementById('statActiveLinks').textContent = '启用中 ' + data.stats.activeLinks + ' 条';
@@ -1331,6 +1615,7 @@ export function createApp(options = {}) {
       }
 
       function showView(name) {
+        document.getElementById('lockedView').classList.toggle('hidden', name !== 'locked');
         document.getElementById('loginView').classList.toggle('hidden', name !== 'login');
         document.getElementById('dashboardView').classList.toggle('hidden', name !== 'dashboard');
         document.getElementById('navActions').classList.toggle('hidden', name !== 'dashboard');
@@ -1363,7 +1648,7 @@ export function createApp(options = {}) {
         var pw = document.getElementById('passwordInput').value;
         btn.disabled = true;
         try {
-          await apiFetch('/__admin_api/login', { method: 'POST', body: { password: pw } });
+          await apiFetch('/login', { method: 'POST', body: { password: pw } });
           document.getElementById('passwordInput').value = '';
           showView('dashboard');
           await loadLinks();
@@ -1375,7 +1660,7 @@ export function createApp(options = {}) {
       };
 
       document.getElementById('logoutBtn').onclick = async function () {
-        await apiFetch('/__admin_api/logout', { method: 'POST' });
+        await apiFetch('/logout', { method: 'POST' });
         showView('login');
       };
 
@@ -1418,10 +1703,10 @@ export function createApp(options = {}) {
           if (oldSlug) {
             payload.old_slug = oldSlug;
             payload.reset_clicks = document.getElementById('resetClicksCheckbox').checked;
-            await apiFetch('/__admin_api/links', { method: 'PUT', body: payload });
+            await apiFetch('/links', { method: 'PUT', body: payload });
             showToast('跳转规则已更新');
           } else {
-            await apiFetch('/__admin_api/links', { method: 'POST', body: payload });
+            await apiFetch('/links', { method: 'POST', body: payload });
             showToast('新建跳转成功');
           }
           closeModal();
@@ -1456,7 +1741,7 @@ export function createApp(options = {}) {
           var text = await file.text();
           var parsed = JSON.parse(text);
           var list = Array.isArray(parsed) ? parsed : (parsed.links || []);
-          var res = await apiFetch('/__admin_api/import', {
+          var res = await apiFetch('/import', {
             method: 'POST',
             body: { links: list }
           });
@@ -1471,7 +1756,11 @@ export function createApp(options = {}) {
 
       (async function init() {
         try {
-          var session = await apiFetch('/__admin_api/session');
+          var session = await apiFetch('/session');
+          if (!session.configured) {
+            showView('locked');
+            return;
+          }
           if (session.authenticated) {
             showView('dashboard');
             await loadLinks();
@@ -1491,6 +1780,10 @@ export function createApp(options = {}) {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
       'X-Frame-Options': 'DENY',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      'X-Robots-Tag': 'noindex, nofollow',
+      'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
     });
     res.end(html);
   }
@@ -1510,8 +1803,8 @@ export function createApp(options = {}) {
         return sendJson(res, 200, { status: 'ok' });
       }
 
-      // 2. 后台管理 API
-      if (pathname.startsWith('/__admin_api/')) {
+      // 2. 后台管理 API（挂载于 ${adminPath}/api/*，支持自定义路径完全隐匿）
+      if (pathname.startsWith(apiPrefix)) {
         return await handleAdminApi(req, res, ctx);
       }
 
@@ -1526,14 +1819,14 @@ export function createApp(options = {}) {
         return sendAdminHtml(res);
       }
 
-      // 4. 静态爬虫与图标路径
+      // 4. 静态爬虫与图标路径（绝不在 robots.txt 中回显 adminPath，防止暴露自定义后台入口）
       if (pathname === '/favicon.ico') {
         res.writeHead(204, { 'Cache-Control': 'public, max-age=86400' });
         return res.end();
       }
       if (pathname === '/robots.txt') {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end(`User-agent: *\nDisallow: ${adminPath}\nDisallow: /__admin_api/\n`);
+        return res.end('User-agent: *\nDisallow:\n');
       }
 
       // 5. 短路径查询与重定向
@@ -1572,10 +1865,10 @@ export function createApp(options = {}) {
         Location: safeLocation,
         'Cache-Control': cacheControl,
         'X-Robots-Tag': 'noindex',
+        'Referrer-Policy': 'no-referrer',
       });
       res.end();
 
-      // 仅对真实 GET 访问记录点击统计（排除 HEAD 预检探测），且响应发出后执行零阻塞
       if (method === 'GET') {
         try {
           stmts.recordClick.run(new Date().toISOString(), link.slug);
@@ -1596,6 +1889,7 @@ export function createApp(options = {}) {
   return {
     handler,
     adminPath,
+    passwordConfigured,
     close() {
       db.close();
     },

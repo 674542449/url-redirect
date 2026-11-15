@@ -9,7 +9,7 @@ if (fs.existsSync('.env') && typeof process.loadEnvFile === 'function') {
 const PORT = Number(process.env.PORT || process.env.HOST_PORT) || 8080;
 const HOST = process.env.HOST || '0.0.0.0';
 const DB_PATH = process.env.DB_PATH || './data/links.db';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const ADMIN_PATH = process.env.ADMIN_PATH || '/admin';
 
 const app = createApp({
@@ -31,6 +31,9 @@ server.listen(PORT, HOST, () => {
   console.log(` 监听地址: http://${HOST}:${PORT}`);
   console.log(` 管理后台: http://localhost:${PORT}${app.adminPath}`);
   console.log(` 数据文件: ${DB_PATH}`);
+  if (!app.passwordConfigured) {
+    console.warn(' [安全警告] 未配置合规的 ADMIN_PASSWORD（需至少8位且非弱口令），后台已自动安全锁定！');
+  }
   console.log('====================================================');
 });
 
